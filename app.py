@@ -37,7 +37,7 @@ DISK_SAFETY_FACTOR = 2.5
 
 def resource_path(relative: str) -> Path:
     """
-    Works in source mode and after Nuitka onefile/standalone compilation.
+    Works in source mode and after Nuitka or PyInstaller compilation.
     """
     candidates: list[Path] = []
 
@@ -96,7 +96,7 @@ class ProcessSettings:
         background_tolerance = max(0, min(100, int(payload.get("backgroundTolerance", 10))))
 
         method = str(payload.get("method", "nearest"))
-        allowed_methods = {"nearest", "median", "mode", "dominant", "qvote"}
+        allowed_methods = {"nearest", "median", "mode", "dominant", "qvote", "lanczos"}
         if method not in allowed_methods:
             method = "nearest"
 
@@ -304,22 +304,41 @@ class Processor:
 
             scale = self._detect_scale(normalized, settings.detect_method, settings.scale)
 
-            command = [
-                str(self.binary),
-                "downscale",
-                str(normalized),
-                "--output",
-                str(downscaled),
-                "--scale",
-                str(scale),
-                "--method",
-                settings.method,
-            ]
+            if settings.method == "lanczos":
+                resample_source = normalized
+                if settings.snap_grid and scale > 1:
+                    resample_source = tmp_dir / "aligned.png"
+                    self._run([
+                        str(self.binary), "snap", str(normalized),
+                        "--output", str(resample_source), "--scale", str(scale),
+                    ])
+                # Premultiplied alpha prevents hidden RGB from tinting the edges.
+                with Image.open(resample_source) as image:
+                    if scale <= 1:
+                        reduced = image.copy()
+                    else:
+                        size = (max(1, image.width // scale), max(1, image.height // scale))
+                        reduced = image.convert("RGBa").resize(
+                            size, Image.Resampling.LANCZOS
+                        ).convert("RGBA")
+                    reduced.save(downscaled, "PNG")
+            else:
+                command = [
+                    str(self.binary),
+                    "downscale",
+                    str(normalized),
+                    "--output",
+                    str(downscaled),
+                    "--scale",
+                    str(scale),
+                    "--method",
+                    settings.method,
+                ]
 
-            if not settings.snap_grid:
-                command.append("--no-align")
+                if not settings.snap_grid:
+                    command.append("--no-align")
 
-            self._run(command)
+                self._run(command)
             current = downscaled
 
             if settings.quantize:
@@ -365,7 +384,8 @@ class Processor:
 
 class Api:
     def __init__(self) -> None:
-        self.window: webview.Window | None = None
+        # Keep the native window out of pywebview public API introspection.
+        self._window: webview.Window | None = None
         self.processor = Processor()
         self.temp_root = Path(tempfile.mkdtemp(prefix="pixel_forge_"))
         self.source_kind: str | None = None
@@ -499,10 +519,10 @@ class Api:
         return candidate
 
     def _dialog(self, dialog_type: int, **kwargs) -> Path | None:
-        if self.window is None:
+        if self._window is None:
             raise RuntimeError("Окно ещё не инициализировано")
 
-        result = self.window.create_file_dialog(dialog_type, **kwargs)
+        result = self._window.create_file_dialog(dialog_type, **kwargs)
         if not result:
             return None
 
@@ -517,21 +537,25 @@ class Api:
         raise RuntimeError("Диалог выбора файла вернул неизвестный формат пути")
 
     def choose_image(self) -> dict[str, Any]:
-        path = self._dialog(
-            webview.FileDialog.OPEN,
-            allow_multiple=False,
-            file_types=("Images (*.png;*.jpg;*.jpeg;*.webp)",),
-        )
-        if path is None:
-            return {"cancelled": True}
-
+        if self._window is None:
+            return self._safe_error("Окно ещё не инициализировано")
         try:
-            self._validate_image_file(path)
+            selected = self._window.create_file_dialog(
+                webview.FileDialog.OPEN,
+                allow_multiple=True,
+                file_types=("Images (*.png;*.jpg;*.jpeg;*.webp)",),
+            )
+            if not selected:
+                return {"cancelled": True}
+            if isinstance(selected, (str, os.PathLike)):
+                selected = [selected]
+            paths = list(dict.fromkeys(Path(item).resolve() for item in selected))
+            for path in paths:
+                self._validate_image_file(path)
             self.reset_source()
-            self.source_kind = "image"
-            self.source_path = path
-            self.archive_root = None
-            self.files = [path]
+            self.source_kind = "files" if len(paths) > 1 else "image"
+            self.source_path = paths[0]
+            self.files = paths
             return self._source_payload(0)
         except Exception as error:
             return self._safe_error(self._friendly_exception(error))
@@ -804,6 +828,43 @@ class Api:
         except Exception as error:
             return self._safe_error(self._friendly_exception(error))
 
+    def export_files(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.source_kind != "files" or not self.files:
+            return self._safe_error("Сначала выбери несколько изображений")
+        destination = self._dialog(webview.FileDialog.FOLDER)
+        if destination is None:
+            return {"cancelled": True}
+        return self._export_files_to(destination, payload)
+
+    def _export_files_to(self, destination: Path, payload: dict[str, Any]) -> dict[str, Any]:
+        settings = ProcessSettings.from_payload(payload)
+        self.cancel_requested = False
+        processed = 0
+        try:
+            destination = destination.resolve()
+            destination.mkdir(parents=True, exist_ok=True)
+            estimated = self._estimate_archive_work_bytes()
+            self._ensure_free_space(destination, estimated, "сохранение изображений")
+            self._ensure_free_space(self.temp_root, max(self._estimate_single_work_bytes(p) for p in self.files), "обработка изображений")
+            used = {path.name.lower() for path in destination.iterdir()}
+            for source in self.files:
+                if self.cancel_requested:
+                    return {"cancelled": True, "processed": processed, "path": str(destination)}
+                # Keep source images and previous exports when names collide.
+                relative = Path(source.stem + "_unfaked.png")
+                output = self._unique_output_path(destination, relative, used)
+                self.processor.process(source, output, settings)
+                processed += 1
+                if self._window:
+                    self._window.evaluate_js(
+                        f"window.updateBatchProgress({processed}, {len(self.files)}, {json.dumps(source.name)})"
+                    )
+            return {"ok": True, "path": str(destination), "count": processed}
+        except Exception as error:
+            return self._safe_error(
+                f"{self._friendly_exception(error)} Обработано файлов: {processed}."
+            )
+
     def export_archive(self, payload: dict[str, Any]) -> dict[str, Any]:
         if self.source_kind != "archive" or not self.files or self.archive_root is None:
             return self._safe_error("Сначала выбери ZIP-архив")
@@ -872,9 +933,9 @@ class Api:
                 )
                 self.processor.process(source, output, settings)
 
-                if self.window:
+                if self._window:
                     name_json = json.dumps(relative.as_posix())
-                    self.window.evaluate_js(
+                    self._window.evaluate_js(
                         f"window.updateBatchProgress({current}, {total}, {name_json})"
                     )
 
@@ -1924,7 +1985,7 @@ APP_HTML = r"""<!doctype html>
       </div>
 
       <div class="top-actions">
-        <button class="ghost" id="openImageBtn">Изображение</button>
+        <button class="ghost" id="openImageBtn">Изображения</button>
         <button class="ghost" id="openArchiveBtn">ZIP-архив</button>
       </div>
     </header>
@@ -1937,7 +1998,7 @@ APP_HTML = r"""<!doctype html>
             <div class="file-icon" id="sourceKindIcon">PNG</div>
             <div class="file-meta">
               <strong id="selectedFileName">Файл не выбран</strong>
-              <span id="selectedFileMeta">Откройте изображение или ZIP</span>
+              <span id="selectedFileMeta">Откройте изображения или ZIP</span>
             </div>
           </button>
         </div>
@@ -1945,7 +2006,7 @@ APP_HTML = r"""<!doctype html>
         <section id="archiveBrowser" class="archive-browser hidden">
           <div class="archive-browser-header">
             <div>
-              <strong>Содержимое архива</strong>
+              <strong id="fileListTitle">Изображения</strong>
               <span id="archiveSummary">0 изображений</span>
             </div>
             <button id="collapseArchiveBrowserBtn" class="archive-browser-collapse" type="button" aria-label="Свернуть список">−</button>
@@ -2003,6 +2064,7 @@ APP_HTML = r"""<!doctype html>
                   <div class="custom-select-menu hidden">
                     <button class="method-tooltip" type="button" data-value="nearest" data-tooltip="Берёт ближайший пиксель из каждого блока. Быстро и предсказуемо, но может сохранять случайный цвет блока.">Nearest</button>
                     <button class="method-tooltip" type="button" data-value="dominant" data-tooltip="Выбирает преобладающий цвет блока. Часто лучше сохраняет крупные однородные области.">Dominant</button>
+                    <button class="method-tooltip" type="button" data-value="lanczos" data-tooltip="Уменьшает изображение со сглаживанием и сохранением бликов. Подходит для объёмных и рисованных иконок. Может добавлять промежуточные оттенки.">Lanczos</button>
                     <button class="method-tooltip" type="button" data-value="median" data-tooltip="Использует медианный цвет блока и устойчив к единичному цветовому шуму.">Median</button>
                     <button class="method-tooltip" type="button" data-value="mode" data-tooltip="Выбирает цвет, который встречается в блоке чаще всего. Подходит для ограниченных палитр.">Mode</button>
                     <button class="method-tooltip" type="button" data-value="qvote" data-tooltip="Квантизует цвета блока и выбирает результат голосованием. Полезен для сложных или слегка испорченных изображений.">QVote</button>
@@ -2014,7 +2076,7 @@ APP_HTML = r"""<!doctype html>
 
             <label class="switch-row">
               <div>
-                <strong class="tooltip-target" data-tooltip="Привязывает выбор блоков к простой равномерной сетке. Полезно, когда изображение увеличено целым коэффициентом без смещения.">Simple Grid</strong>
+                <strong class="tooltip-target" data-tooltip="Выравнивает пиксельную сетку перед уменьшением, в том числе для Lanczos. Может обрезать края и уменьшить итоговый размер.">Simple Grid</strong>
                 <span>Выравнивать пиксельную сетку</span>
               </div>
               <input id="snapGrid" class="switch-control" type="checkbox" checked>
@@ -2138,10 +2200,10 @@ APP_HTML = r"""<!doctype html>
         <div id="dropZone" class="drop-zone empty">
           <div id="emptyState" class="empty-state">
             <div class="drop-icon">▧</div>
-            <h2>Откройте изображение или ZIP</h2>
-            <p>Файл будет выбран через стандартное окно macOS</p>
+            <h2>Откройте изображения или ZIP</h2>
+            <p>Несколько файлов можно выбрать с помощью Ctrl или Shift</p>
             <div class="empty-actions">
-              <button class="primary" id="emptyImageBtn">Открыть изображение</button>
+              <button class="primary" id="emptyImageBtn">Открыть изображения</button>
               <button class="secondary" id="emptyArchiveBtn">Открыть ZIP</button>
             </div>
           </div>
@@ -2231,7 +2293,7 @@ APP_HTML = r"""<!doctype html>
       $("saveZipBtn").addEventListener("click", saveZip);
       $("cancelBtn").addEventListener("click", cancelBatch);
       $("filePickerBtn").addEventListener("click", () => {
-        if (state.kind === "archive") {
+        if (["archive", "files"].includes(state.kind)) {
           state.archiveTreeCollapsed = !state.archiveTreeCollapsed;
           $("archiveBrowser").classList.toggle("collapsed", state.archiveTreeCollapsed);
           $("collapseArchiveBrowserBtn").textContent = state.archiveTreeCollapsed ? "+" : "−";
@@ -2244,6 +2306,8 @@ APP_HTML = r"""<!doctype html>
         $("collapseArchiveBrowserBtn").textContent = state.archiveTreeCollapsed ? "+" : "−";
       });
       initializeCustomSelects();
+      document.querySelector(".tool-panels").addEventListener("scroll", closeAllCustomSelects);
+      window.addEventListener("resize", closeAllCustomSelects);
       $("scaleMinus").addEventListener("click", () => changeScale(-1));
       $("scalePlus").addEventListener("click", () => changeScale(1));
       $("scale").addEventListener("change", normalizeScale);
@@ -2304,6 +2368,18 @@ APP_HTML = r"""<!doctype html>
           if (willOpen) {
             menu.classList.remove("hidden");
             select.classList.add("open");
+            // Keep the full list accessible outside the scrolling tool panel.
+            const bounds = trigger.getBoundingClientRect();
+            const below = window.innerHeight - bounds.bottom - 12;
+            const above = bounds.top - 12;
+            menu.style.position = "fixed";
+            menu.style.left = bounds.left + "px";
+            menu.style.right = "auto";
+            menu.style.width = bounds.width + "px";
+            menu.style.maxHeight = Math.max(40, above, below) + "px";
+            menu.style.overflowY = "auto";
+            const height = menu.getBoundingClientRect().height;
+            menu.style.top = (below >= height ? bounds.bottom + 6 : Math.max(6, bounds.top - height - 6)) + "px";
           }
         });
 
@@ -2629,7 +2705,7 @@ APP_HTML = r"""<!doctype html>
         if (!element) return;
 
         if (id === "saveZipBtn") {
-          element.disabled = isBusy || state.kind !== "archive";
+          element.disabled = isBusy || !["archive", "files"].includes(state.kind);
         } else if (["previewBtn", "savePngBtn", "filePickerBtn"].includes(id)) {
           element.disabled = isBusy || !state.loaded;
         } else {
@@ -2668,7 +2744,7 @@ APP_HTML = r"""<!doctype html>
 
       $("selectedFileName").textContent = "Файл не выбран";
       $("selectedFileName").title = "";
-      $("selectedFileMeta").textContent = "Откройте изображение или ZIP";
+      $("selectedFileMeta").textContent = "Откройте изображения или ZIP";
       $("stageFileName").textContent = "Предпросмотр";
       $("stageFileName").title = "";
       $("stageDimensions").textContent = "Файл не выбран";
@@ -2713,7 +2789,7 @@ APP_HTML = r"""<!doctype html>
     async function chooseImage() {
       if (state.busy) return;
       setBusy(true);
-      setStatus("Открытие изображения…", "busy");
+      setStatus("Открытие изображений…", "busy");
 
       try {
         const data = await pywebview.api.choose_image();
@@ -2748,10 +2824,11 @@ APP_HTML = r"""<!doctype html>
       state.index = data.index;
       state.files = data.files;
 
-      $("sourceKindIcon").textContent = data.kind === "archive" ? "ZIP" : "PNG";
-      $("archiveBrowser").classList.toggle("hidden", data.kind !== "archive");
+      $("sourceKindIcon").textContent = data.kind === "archive" ? "ZIP" : (data.kind === "files" ? "IMG" : "PNG");
+      $("archiveBrowser").classList.toggle("hidden", data.count <= 1);
+      $("fileListTitle").textContent = data.kind === "archive" ? "Содержимое архива" : "Выбранные изображения";
 
-      if (data.kind === "archive") {
+      if (data.count > 1) {
         state.archiveTreeCollapsed = false;
         $("archiveBrowser").classList.remove("collapsed");
         $("collapseArchiveBrowserBtn").textContent = "−";
@@ -2765,7 +2842,8 @@ APP_HTML = r"""<!doctype html>
 
       $("previewBtn").disabled = false;
       $("savePngBtn").disabled = false;
-      $("saveZipBtn").disabled = data.kind !== "archive";
+      $("saveZipBtn").disabled = !["archive", "files"].includes(data.kind);
+      $("saveZipBtn").textContent = data.kind === "files" ? "Сохранить все PNG в папку" : "Обработать весь ZIP";
       $("filePickerBtn").disabled = false;
       $("dropZone").classList.remove("empty");
       $("emptyState").classList.add("hidden");
@@ -2778,7 +2856,7 @@ APP_HTML = r"""<!doctype html>
       $("selectedFileName").textContent = middleEllipsis(data.fileName, 46);
       $("selectedFileName").title = data.fileName;
       $("selectedFileMeta").textContent = `${data.width} × ${data.height} • ${data.index + 1} из ${data.count}`;
-      $("savePngBtn").textContent = data.kind === "archive"
+      $("savePngBtn").textContent = data.count > 1
         ? "Обработать выбранный PNG"
         : "Обработать PNG";
       $("stageFileName").textContent = middleEllipsis(data.fileName, 72);
@@ -2965,17 +3043,19 @@ APP_HTML = r"""<!doctype html>
     }
 
     async function saveZip() {
-      if (state.kind !== "archive" || state.busy) return;
+      if (!["archive", "files"].includes(state.kind) || state.busy) return;
       setBusy(true);
       $("progressBar").style.width = "0%";
       $("cancelBtn").classList.remove("hidden");
       setStatus("Пакетная обработка…", "busy");
 
       try {
-        const data = await pywebview.api.export_archive(currentSettings());
+        const data = state.kind === "files"
+          ? await pywebview.api.export_files(currentSettings())
+          : await pywebview.api.export_archive(currentSettings());
         if (!data) return;
         if (data.cancelled) {
-          setStatus("Обработка архива отменена", "ready");
+          setStatus("Обработка отменена" + (data.processed ? ": сохранено " + data.processed : ""), "ready");
           return;
         }
         if (handleError(data)) return;
@@ -3010,10 +3090,11 @@ def main() -> None:
         js_api=api,
         width=1140,
         height=720,
-        resizable=False,
+        resizable=True,
+        min_size=(900, 600),
         background_color="#0b0d12",
     )
-    api.window = window
+    api._window = window
     window.events.closed += api.cleanup
     webview.start(debug=False)
 
